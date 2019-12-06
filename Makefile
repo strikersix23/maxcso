@@ -1,4 +1,4 @@
-PREFIX ?= /usr/local
+PREFIX ?= /data/data/com.termux/files/usr
 BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
 
