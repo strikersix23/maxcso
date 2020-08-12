@@ -9,6 +9,8 @@
 
 namespace maxcso {
 
+static const uint32_t MAX_BLOCK_SIZE = 0x40000;
+
 Input::Input(uv_loop_t *loop)
 	: loop_(loop), type_(UNKNOWN), paused_(false), resumeShouldRead_(false), size_(-1), cache_(nullptr),
 	csoIndex_(nullptr), daxSize_(nullptr), daxIsNC_(nullptr) {
@@ -56,6 +58,7 @@ void Input::DetectFormat() {
 		}
 		uv_fs_req_cleanup(req);
 
+		bool freeHeaderBuf = true;
 		const bool isZSO = !memcmp(headerBuf, ZSO_MAGIC, 4);
 		if (isZSO || !memcmp(headerBuf, CSO_MAGIC, 4)) {
 			const CSOHeader *const header = reinterpret_cast<CSOHeader *>(headerBuf);
@@ -66,7 +69,7 @@ void Input::DetectFormat() {
 			}
 			if (header->version > 2) {
 				finish_(false, "CSO header indicates unsupported version");
-			} else if (header->sector_size < SECTOR_SIZE || header->sector_size > pool.bufferSize) {
+			} else if (header->sector_size < SECTOR_SIZE || header->sector_size > MAX_BLOCK_SIZE) {
 				finish_(false, "CSO header indicates unsupported sector size");
 			} else if ((header->uncompressed_size & SECTOR_MASK) != 0) {
 				finish_(false, "CSO uncompressed size not aligned to sector size");
@@ -76,15 +79,26 @@ void Input::DetectFormat() {
 				csoBlockSize_ = header->sector_size;
 
 				csoBlockShift_ = 0;
-				for (uint32_t i = header->sector_size; i > 1; i >>= 1) {
+				for (uint32_t i = csoBlockSize_; i > 1; i >>= 1) {
 					++csoBlockShift_;
+				}
+
+				pool.Release(headerBuf);
+				freeHeaderBuf = false;
+				// Over-allocate a bit in case of inefficient padding between blocks.
+				if (csoBlockSize_ * 2 > pool.bufferSize) {
+					if (!pool.SetBufferSize(csoBlockSize_ * 2)) {
+						finish_(false, "Unable to update buffer size to match decompress block size");
+						size_ = -1;
+						return;
+					}
 				}
 
 				const uint32_t sectors = static_cast<uint32_t>(SizeAligned() >> csoBlockShift_);
 				csoIndex_ = new uint32_t[sectors + 1];
 				const unsigned int bytes = (sectors + 1) * sizeof(uint32_t);
 				const uv_buf_t buf = uv_buf_init(reinterpret_cast<char *>(csoIndex_), bytes);
-				SetupCache(header->sector_size);
+				SetupCache(csoBlockSize_);
 
 				uv_.fs_read(loop_, &req_, file_, &buf, 1, sizeof(CSOHeader), [this, bytes](uv_fs_t *req) {
 					if (req->result != bytes) {
@@ -169,7 +183,10 @@ void Input::DetectFormat() {
 				}
 			});
 		}
-		pool.Release(headerBuf);
+
+		if (freeHeaderBuf) {
+			pool.Release(headerBuf);
+		}
 	});
 }
 
@@ -311,12 +328,13 @@ void Input::EnqueueDecompressSector(uint8_t *src, uint32_t len, uint32_t offset,
 	// We swap this with the compressed buf, and free the readBuf.
 	uint8_t *const actualBuf = pool.Alloc();
 	decompressError_.clear();
+	decompressResultSize_ = 0;
 	uv_.queue_work(loop_, &work_, [this, actualBuf, src, len, isLZ4](uv_work_t *req) {
 		bool result;
 		if (isLZ4) {
-			result = DecompressSectorLZ4(actualBuf, src, len, csoBlockSize_, decompressError_);
+			result = DecompressSectorLZ4(actualBuf, src, len, csoBlockSize_, decompressResultSize_, decompressError_);
 		} else {
-			result = DecompressSectorDeflate(actualBuf, src, len, type_, decompressError_);
+			result = DecompressSectorDeflate(actualBuf, src, len, type_, decompressResultSize_, decompressError_);
 		}
 		if (!result) {
 			if (decompressError_.empty()) {
@@ -333,11 +351,23 @@ void Input::EnqueueDecompressSector(uint8_t *src, uint32_t len, uint32_t offset,
 			pool.Release(actualBuf);
 			return;
 		}
+		if (decompressResultSize_ > csoBlockSize_) {
+			finish_(false, "Decompression produced more data than expected");
+			pool.Release(actualBuf);
+			return;
+		}
+
+		int64_t sectorPos = pos_ - offset;
+		uint32_t resultSize = decompressResultSize_;
+		if (sectorPos + resultSize > size_) {
+			// Ignore the padding at the end of the last block.
+			resultSize = static_cast<uint32_t>(size_ - sectorPos);
+		}
 
 		// If the input has a larger block size than SECTOR_SIZE, queue each up here.
 		// Prevents double decompression of input blocks.
-		for (uint32_t suboffset = offset; suboffset < csoBlockSize_; suboffset += SECTOR_SIZE) {
-			const bool lastSubBlock = suboffset + SECTOR_SIZE >= csoBlockSize_;
+		for (uint32_t suboffset = offset; suboffset < resultSize; suboffset += SECTOR_SIZE) {
+			const bool lastSubBlock = suboffset + SECTOR_SIZE >= resultSize;
 			uint8_t *const subBuf = lastSubBlock ? actualBuf : pool.Alloc();
 			if (lastSubBlock) {
 				memmove(actualBuf, actualBuf + suboffset, SECTOR_SIZE);
@@ -372,7 +402,7 @@ void Input::Resume() {
 	}
 }
 
-bool Input::DecompressSectorDeflate(uint8_t *dst, const uint8_t *src, unsigned int len, FileType type, std::string &err) {
+bool Input::DecompressSectorDeflate(uint8_t *dst, const uint8_t *src, unsigned int len, FileType type, uint32_t &readSize, std::string &err) {
 	z_stream z;
 	memset(&z, 0, sizeof(z));
 	// TODO: inflateReset2?
@@ -401,15 +431,18 @@ bool Input::DecompressSectorDeflate(uint8_t *dst, const uint8_t *src, unsigned i
 	}
 
 	inflateEnd(&z);
+	readSize = static_cast<uint32_t>(z.total_out);
 	return true;
 }
 
-bool Input::DecompressSectorLZ4(uint8_t *dst, const uint8_t *src, unsigned int len, int dstSize, std::string &err) {
+bool Input::DecompressSectorLZ4(uint8_t *dst, const uint8_t *src, unsigned int len, int dstSize, uint32_t &readSize, std::string &err) {
 	// We use partial because we don't know the size of the input data.  It could include padding.
-	if (LZ4_decompress_safe_partial(reinterpret_cast<const char *>(src), reinterpret_cast<char *>(dst), len, dstSize, dstSize) < 0) {
+	int actualSize = LZ4_decompress_safe_partial(reinterpret_cast<const char *>(src), reinterpret_cast<char *>(dst), len, dstSize, dstSize);
+	if (actualSize < 0) {
 		err = "LZ4 decompression failed.";
 		return false;
 	}
+	readSize = static_cast<uint32_t>(actualSize);
 	return true;
 }
 

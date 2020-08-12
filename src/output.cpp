@@ -58,13 +58,15 @@ void Output::SetFile(uv_file file, int64_t srcSize, uint32_t blockSize, CSOForma
 	// For now, just take worst case (all blocks stored uncompressed.)
 	int64_t worstSize = dstPos_ + srcSize;
 	indexShift_ = 0;
-	for (int i = 62; i >= 31; --i) {
-		int64_t max = 1LL << i;
-		if (worstSize >= max) {
-			// This means we need i + 1 bits to store the position.
-			// We have to shift enough off to fit into 31.
-			indexShift_ = i + 1 - 31;
-			break;
+	if ((flags_ & TASKFLAG_DECOMPRESS) == 0) {
+		for (int i = 62; i >= 31; --i) {
+			int64_t max = 1LL << i;
+			if (worstSize >= max) {
+				// This means we need i + 1 bits to store the position.
+				// We have to shift enough off to fit into 31.
+				indexShift_ = i + 1 - 31;
+				break;
+			}
 		}
 	}
 
@@ -198,8 +200,7 @@ void Output::HandleReadySector(Sector *sector) {
 	// We'll just write them all together.
 	std::vector<Sector *> sectors;
 	sectors.push_back(sector);
-	// TODO: Try other numbers.
-	static const size_t MAX_BUFS = 8;
+	static const size_t MAX_BUFS = 16;
 	int64_t nextPos = srcPos_ + blockSize_;
 	auto it = pendingSectors_.find(nextPos);
 	while (it != pendingSectors_.end()) {
@@ -208,7 +209,7 @@ void Output::HandleReadySector(Sector *sector) {
 		nextPos += blockSize_;
 		it = pendingSectors_.find(nextPos);
 
-		// Don't do more than 4 at a time.
+		// Don't do more than MAX_BUFS at a time.
 		if (sectors.size() >= MAX_BUFS) {
 			break;
 		}
@@ -222,6 +223,14 @@ void Output::HandleReadySector(Sector *sector) {
 		unsigned int bestSize = sectors[i]->BestSize();
 		if (!UpdateIndex(sectors[i]->Pos(), dstPos, bestSize, sectors[i]->Format())) {
 			return;
+		}
+
+		// In case there's padding in the compressed file, discard as needed.
+		if ((flags_ & TASKFLAG_DECOMPRESS) != 0 && dstPos + bestSize > srcSize_) {
+			bestSize = static_cast<unsigned int>(srcSize_ - dstPos);
+		}
+		if (bestSize == 0) {
+			continue;
 		}
 
 		bufs[nbufs++] = uv_buf_init(reinterpret_cast<char *>(sectors[i]->BestBuffer()), bestSize);
